@@ -106,7 +106,10 @@ async def tidal_search(spotify_track, rate_limiter, tidal_session: tidalapi.Sess
             album_result = tidal_session.search(query, models=[tidalapi.album.Album])
             for album in album_result['albums']:
                 if album.num_tracks >= spotify_track['track_number'] and test_album_similarity(spotify_track['album'], album):
-                    album_tracks = album.tracks()
+                    try:
+                        album_tracks = album.tracks()
+                    except tidalapi.exceptions.ObjectNotFound:
+                        continue  # album in search results but missing from regional catalog
                     if len(album_tracks) < spotify_track['track_number']:
                         assert( not len(album_tracks) == album.num_tracks ) # incorrect metadata :(
                         continue
@@ -158,10 +161,23 @@ async def repeat_on_request_error(function, *args, remaining=5, **kwargs):
         return await repeat_on_request_error(function, *args, remaining=remaining-1, **kwargs)
 
 
+def _extract_tracks_from_items(items):
+    """Robust extractor — handles legacy 'track' key, new 'item' key, and flattened payloads."""
+    out = []
+    for row in items:
+        if 'track' in row and isinstance(row['track'], dict):
+            out.append(row['track'])
+        elif 'item' in row and isinstance(row['item'], dict):
+            out.append(row['item'])
+        elif isinstance(row, dict) and 'id' in row and 'uri' in row:
+            out.append(row)
+    return out
+
+
 async def _fetch_all_from_spotify_in_chunks(fetch_function: Callable) -> List[dict]:
     output = []
     results = fetch_function(0)
-    output.extend([item['track'] for item in results['items'] if item['track'] is not None])
+    output.extend(_extract_tracks_from_items(results['items']))
 
     # Get all the remaining tracks in parallel
     if results['next']:
@@ -171,15 +187,14 @@ async def _fetch_all_from_spotify_in_chunks(fetch_function: Callable) -> List[di
             desc="Fetching additional data chunks"
         )
         for extra_result in extra_results:
-            output.extend([item['track'] for item in extra_result['items'] if item['track'] is not None])
+            output.extend(_extract_tracks_from_items(extra_result['items']))
 
     return output
 
 
 async def get_tracks_from_spotify_playlist(spotify_session: spotipy.Spotify, spotify_playlist):
     def _get_tracks_from_spotify_playlist(offset: int, playlist_id: str):
-        fields = "next,total,limit,items(track(name,album(name,artists),artists,track_number,duration_ms,id,external_ids(isrc))),type"
-        return spotify_session.playlist_tracks(playlist_id=playlist_id, fields=fields, offset=offset)
+        return spotify_session.playlist_tracks(playlist_id=playlist_id, offset=offset)
 
     print(f"Loading tracks from Spotify playlist '{spotify_playlist['name']}'")
     items = await repeat_on_request_error( _fetch_all_from_spotify_in_chunks, lambda offset: _get_tracks_from_spotify_playlist(offset=offset, playlist_id=spotify_playlist["id"]))
