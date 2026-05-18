@@ -1,6 +1,8 @@
 import asyncio
 import math
+import time
 from typing import List
+import requests
 import tidalapi
 from tqdm import tqdm
 from tqdm.asyncio import tqdm as atqdm
@@ -18,12 +20,29 @@ def clear_tidal_playlist(playlist: tidalapi.UserPlaylist, chunk_size: int=20):
             _remove_indices_from_playlist(playlist, indices)
             progress.update(len(indices))
     
+def _add_chunk_with_etag_retry(playlist: tidalapi.UserPlaylist, chunk: List[int], max_attempts: int=6):
+    """Tidal's playlist add uses an If-None-Match ETag precondition. After a
+    chunk write the backend is eventually-consistent, so a freshly _reparse()'d
+    ETag can already be stale for the next chunk -> HTTP 412. Retry with a
+    re-fetched ETag and linear backoff so the backend can settle."""
+    for attempt in range(max_attempts):
+        try:
+            playlist.add(chunk)
+            return
+        except requests.exceptions.HTTPError as e:
+            status = getattr(e.response, "status_code", None)
+            if status == 412 and attempt < max_attempts - 1:
+                time.sleep(1 + attempt)      # let Tidal's backend converge
+                playlist._reparse()          # pull a fresh ETag
+                continue
+            raise
+
 def add_multiple_tracks_to_playlist(playlist: tidalapi.UserPlaylist, track_ids: List[int], chunk_size: int=20):
     offset = 0
     with tqdm(desc="Adding new tracks to Tidal playlist", total=len(track_ids)) as progress:
         while offset < len(track_ids):
             count = min(chunk_size, len(track_ids) - offset)
-            playlist.add(track_ids[offset:offset+chunk_size])
+            _add_chunk_with_etag_retry(playlist, track_ids[offset:offset+chunk_size])
             offset += count
             progress.update(count)
 
